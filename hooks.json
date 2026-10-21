@@ -1,0 +1,24 @@
+{
+  "terminal-task-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/pre_run_command.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python scripts/stop_watchdog.py",
+        "timeout": 5
+      }
+    ]
+  }
+}
