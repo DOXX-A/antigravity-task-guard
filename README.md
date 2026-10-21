@@ -80,6 +80,13 @@ antigravity-task-guard/
 
 ## Installation
 
+Clone this repository:
+
+```bash
+git clone https://github.com/DOXX-A/antigravity-task-guard.git
+cd antigravity-task-guard
+```
+
 ### Option A: Global Installation (Recommended)
 
 Applies across all projects and workspaces on your machine.

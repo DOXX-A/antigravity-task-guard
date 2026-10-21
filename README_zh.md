@@ -80,6 +80,13 @@ antigravity-task-guard/
 
 ## 安装使用
 
+首先克隆本项目到本地：
+
+```bash
+git clone https://github.com/DOXX-A/antigravity-task-guard.git
+cd antigravity-task-guard
+```
+
 ### 方式 A：全局安装（推荐）
 
 全局安装将对当前机器上的所有工作区与项目统一生效。
