@@ -1,0 +1,5 @@
+{
+  "name": "antigravity-task-guard",
+  "description": "Lifecycle watchdog and sync-timeout optimization hooks for terminal tasks in Google Antigravity.",
+  "version": "1.0.0"
+}
