@@ -1,164 +1,141 @@
 # Antigravity Task Guard
 
-适用于 Google Antigravity (AGY) 的后台终端任务生命周期守护机制，用于解决长时间任务挂起、管道死锁及会话永久假死问题。
+A deterministic lifecycle hook protection mechanism for terminal background tasks in Google Antigravity (AGY).
 
 ---
 
-## 问题背景
+## Overview
 
-在 Antigravity 交互中，终端工具（`run_command`）在耗时超过 `WaitMsBeforeAsync` 时会降级转入后台任务（Background Task）。在实际开发（尤其是 Windows 环境）中，该机制常面临以下几种挂起场景：
+When the agent executes commands using `run_command`, commands exceeding `WaitMsBeforeAsync` automatically degrade into background tasks. In practical workflows—particularly on Windows—this mechanism frequently encounters silent hangs:
 
-1. **管道 EOF 信号丢失**：在 Windows PowerShell / cmd 环境下，部分构建工具（如 MSVC、Node、Python）在派生子进程或未完全关闭标准流句柄时退出，导致父级流监听器无法捕获 EOF，终端状态被永久置为 `Running...`。
-2. **交互式输入阻塞**：命令未携带非交互参数（如 `-y` / `--no-input`）时等待 stdin 输入，后台任务无法交互从而挂起。
-3. **过早降级**：默认或较短的等待时间（如 1000~2000ms）导致原本 3~5 秒即可同步完成的命令频繁转入后台，增加了异步通知失败的风险。
-4. **Prompt 软约束失效**：单纯依靠在 `GEMINI.md` 中要求 Agent“转入后台后必须设置看门狗”属于软约束。随着对话轮次增加和上下文膨胀，模型存在概率性漏调 `schedule` 的情况，导致会话失去唤醒锚点。
+* **Pipe EOF Signal Drops**: On Windows (PowerShell/CMD), toolchains (such as MSVC, Node.js, and Python) often exit without closing inherited standard I/O handles. Antigravity's stream listener waits indefinitely for EOF, leaving the task permanently in a `Running...` state.
+* **Premature Task Degradation**: Conservative timeouts (e.g. 1000–2000ms) needlessly push fast tasks (3–5 seconds) into the background runner, increasing async notification failure risks.
+* **Prompt Rule Fragility**: Natural language rules (such as instructions in custom prompt files) are soft constraints. As conversation history grows, models probabilistically omit watchdog timers, leaving hanging background tasks unmonitored.
+
+`Antigravity Task Guard` replaces prompt reliance with deterministic system hooks, preventing hangs at the engine level without requiring custom system prompt modifications.
 
 ---
 
-## 机制设计
+## Mechanism
 
-本项目采用**生命周期钩子（Lifecycle Hooks）硬拦截**与**提示词规程（SOP）闭环**结合的双层防护策略：
+The system operates via two Antigravity lifecycle hooks configured in `hooks.json`:
 
 ```
-[Agent 发起 run_command]
-       │
-       ▼
-[PreToolUse 钩子: pre_run_command.py]
-  - 检查 WaitMsBeforeAsync
-  - 非守护任务自动提升至 10000ms (源头规避 80% 假性后台任务)
-       │
-       ├─ (<= 10s) ──> 同步直接返回，不进后台
-       │
-       └─ (> 10s)  ──> 降级为 Background Task
-                             │
-                             ▼
-                   [Agent 准备结束本轮回复]
-                             │
-                             ▼
-                   [Stop 钩子: stop_watchdog.py]
-                     - 检查 fullyIdle 状态
-                     - 倒序检索上下文轨迹中的 schedule 记录
-                             │
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-      [已设定时器]                      [未设定时器]
-            │                                 │
-            ▼                                 ▼
-        静默放行休眠                  强行拦截并驳回休眠
-                                      注入系统警告迫使 Agent 补调
+[Agent emits run_command]
+          │
+          ▼
+[PreToolUse: pre_run_command.py]
+  - Inspects WaitMsBeforeAsync
+  - Elevates timeout to 10000ms for non-daemon tasks
+          │
+          ├─ (<= 10s) ──> Completes synchronously (never enters background)
+          │
+          └─ (> 10s)  ──> Degrades to Background Task
+                                │
+                                ▼
+                      [Agent attempts to finish turn]
+                                │
+                                ▼
+                      [Stop Hook: stop_watchdog.py]
+                        - Inspects fullyIdle state
+                        - Checks turn transcript for schedule tool calls
+                                │
+               ┌────────────────┴────────────────┐
+               ▼                                 ▼
+        [Watchdog Active]              [No Watchdog Set]
+               │                                 │
+               ▼                                 ▼
+        Allow Turn Stop                Block Termination
+                                       Force Agent to Set Watchdog
 ```
 
-### 1. 前置优化（PreToolUse）
-* **文件**：`scripts/pre_run_command.py`
-* **行为**：拦截 `run_command`。对非守护进程（`IsDaemon != true`），若等待时间小于系统上限（10000ms），通过 `overwrite` 自动提升至 10000ms。使日常编译、检索和常规测试均在同步阶段完成，大幅减少后台任务生成。
+### 1. PreToolUse (`scripts/pre_run_command.py`)
+Intercepts all `run_command` invocations. For non-daemon tasks (`IsDaemon != true`), it automatically overwrites `WaitMsBeforeAsync` to the platform maximum (10000ms). Tasks completing within 10 seconds return synchronously, eliminating the majority of spurious background task transitions.
 
-### 2. 终局拦截（Stop）
-* **文件**：`scripts/stop_watchdog.py`
-* **行为**：在 Agent 尝试停止输出时触发。若 `fullyIdle == false` 且当前轮次未检测到调用 `schedule` 定时器，则返回 `decision: "continue"` 驳回停止请求，并向上下文注入告警，强制 Agent 调用 `schedule` 设置超时保护。
-
-### 3. 规程闭环（GEMINI SOP）
-* **文件**：`rules/GEMINI_RULE.md`
-* **行为**：定义看门狗唤醒后的标准作业程序。Agent 被唤醒后必须检查日志增量；若无更新或异常超时，强制执行 `kill` 终止任务，禁止盲目无限制续订定时器。
+### 2. Stop Hook (`scripts/stop_watchdog.py`)
+Fires when the agent attempts to conclude its turn (`NO_TOOL_CALL`). If background tasks remain active (`fullyIdle == false`) and no `schedule` watchdog was registered in the current turn, the hook blocks termination (`decision: "continue"`). It injects a warning into the agent context, compelling it to inspect the task status or register a timeout watchdog.
 
 ---
 
-## 目录结构
+## Directory Structure
 
 ```
 antigravity-task-guard/
-├── hooks.json                     # Antigravity 生命周期钩子配置
+├── hooks.json                 # Hook registration manifest
 ├── scripts/
-│   ├── pre_run_command.py         # PreToolUse 钩子执行脚本
-│   └── stop_watchdog.py          # Stop 钩子执行脚本
-├── rules/
-│   └── GEMINI_RULE.md             # 推荐配置到 GEMINI.md 的 SOP 规则
-├── install.ps1                    # Windows (PowerShell) 安装脚本
-├── install.sh                     # Linux / macOS (Bash) 安装脚本
-├── LICENSE                        # MIT 协议
+│   ├── pre_run_command.py     # PreToolUse execution script
+│   └── stop_watchdog.py      # Stop hook execution script
+├── install.ps1                # PowerShell installer
+├── install.sh                 # Bash installer
+├── LICENSE                    # MIT License
 └── README.md
 ```
 
 ---
 
-## 安装使用
+## Installation
 
-### 方式 A：全局安装（推荐）
+### Option A: Global Installation (Recommended)
 
-全局安装将对当前机器上的所有工作区与项目统一生效。
+Applies across all projects and workspaces on your machine.
 
 **Windows (PowerShell)**:
 ```powershell
 .\install.ps1 -Scope Global
 ```
-安装目标路径为 `~/.gemini/config/`。
+Installs to `~/.gemini/config/`.
 
 **Linux / macOS (Bash)**:
 ```bash
 bash install.sh Global
 ```
-安装目标路径为 `~/.gemini/config/`。
+Installs to `~/.gemini/config/`.
 
 ---
 
-### 方式 B：单工作区安装
+### Option B: Workspace Installation
 
-仅在当前项目生效，便于随代码仓库分发。
+Applies strictly to the active repository.
 
 **Windows (PowerShell)**:
 ```powershell
 .\install.ps1 -Scope Workspace
 ```
-安装目标路径为当前目录下的 `.agents/`。
+Installs to `.agents/` in the current working directory.
 
 **Linux / macOS (Bash)**:
 ```bash
 bash install.sh Workspace
 ```
-安装目标路径为当前目录下的 `.agents/`。
+Installs to `.agents/` in the current working directory.
 
 ---
 
-## 配置规程
+## Verification
 
-安装脚本文件后，需将 [rules/GEMINI_RULE.md](rules/GEMINI_RULE.md) 中的规则追加至您的全局规程（如 `~/.gemini/GEMINI.md`）或项目规程中：
+You can verify both hooks in an active Antigravity session:
 
-```markdown
-## 后台任务防御与看门狗处置 SOP
-
-1. **源头防护与同步优先**：
-   - 任何命令必须优先携带非交互标志（如 `-y`、`--non-interactive`、`--no-input`、`--batch`），严禁触发控制台交互等待。
-   - 凡执行编译、测试、安装等可能耗时的非守护任务，优先留足同步等待时间（系统已配置 `PreToolUse` Hook 自动提速至 10000ms），尽量在同步阶段完成，避免无谓掉入后台。
-   - 原生原语优先：能用 `view_file`、`write_to_file`、`replace_file_content` 解决的，严禁使用 shell 执行文件查看或写入。
-
-2. **降级看门狗与 Hook 双重闭环**：
-   - 任何命令一旦降级转入后台任务（Background Task），在结束本轮回复前，必须同步调用 `schedule` 设置一个合理时间的看门狗定时器（建议 60~120 秒）。
-   - 若遗漏设置，系统全局 `Stop` Hook 将强制拦截并驳回挂起，直至设置看门狗定时器。
-
-3. **看门狗唤醒处置闭环（严禁盲目续约）**：
-   - 当定时器唤醒 Agent 时，第一步必须调用 `manage_task(Action='status')` 检查最新日志。
-   - 若日志已停止更新或任务无响应，必须果断调用 `manage_task(Action='kill')` 或 `taskkill` 终止任务，严禁在无明确增量进度的情况下无限制二次续约定时器。
-   - 终止后明确向用户汇报终端最后输出与排查建议。
+### 1. Verify Synchronous Elevation (PreToolUse)
+Run a command lasting ~4 seconds with an intentionally small wait threshold:
+```powershell
+powershell -Command "Start-Sleep -Seconds 4; Write-Output 'Done'"
 ```
+The console will display:
+```text
+A pre-tool hook changed the arguments of this tool call before it ran. Changed: WaitMsBeforeAsync.
+```
+The command returns synchronously without generating a background task ID.
 
----
-
-## 验证与测试
-
-可以通过以下两步验证机制是否正常加载：
-
-1. **同步提速验证**：
-   执行任意耗时约 3~5 秒的命令，故意传入较短的 `WaitMsBeforeAsync`（如 2000ms）：
-   ```powershell
-   powershell -Command "Start-Sleep -Seconds 4; Write-Output 'Done'"
-   ```
-   若终端提示 `A pre-tool hook changed the arguments of this tool call before it ran. Changed: WaitMsBeforeAsync.` 且命令直接同步返回，表明 `PreToolUse` 钩子生效。
-
-2. **拦截验证**：
-   发起一个耗时超过 10 秒的后台命令，且不调用 `schedule` 定时器直接尝试结束回复：
-   ```powershell
-   powershell -Command "Start-Sleep -Seconds 20; Write-Output 'Done'"
-   ```
-   系统应触发并输出 `Stop hook blocked termination: 【Hook 看门狗安全拦截】...`，表明 `Stop` 钩子生效。
+### 2. Verify Watchdog Interception (Stop)
+Run a task exceeding 10 seconds, then attempt to conclude the turn without setting a `schedule` timer:
+```powershell
+powershell -Command "Start-Sleep -Seconds 20; Write-Output 'Done'"
+```
+The Stop hook immediately intercepts termination:
+```text
+Stop hook blocked termination: [Hook Watchdog Intercept] Active background task(s) detected, but no schedule watchdog timer was set in this turn...
+```
+The agent is prompted to inspect task status or set a `schedule` watchdog timer before it can finish.
 
 ---
 

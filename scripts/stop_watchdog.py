@@ -11,9 +11,9 @@ def parse_bool(val, default=False):
 
 def check_watchdog_status(transcript_path):
     """
-    检查自上一次用户输入 (USER_INPUT) 以来：
-    1. 是否调用了 schedule 定时器
-    2. 是否有标记为常驻服务 (IsDaemon=True) 的 run_command
+    Check if since the latest user input (USER_INPUT):
+    1. A schedule tool call was made
+    2. A run_command was marked as a long-running daemon (IsDaemon=True)
     """
     if not transcript_path or not os.path.exists(transcript_path):
         return False, False
@@ -25,7 +25,7 @@ def check_watchdog_status(transcript_path):
         has_schedule = False
         has_daemon = False
 
-        # 倒序遍历直到最新的 USER_INPUT
+        # Traverse backwards to find the start of the current turn
         for line in reversed(lines):
             line = line.strip()
             if not line:
@@ -37,7 +37,6 @@ def check_watchdog_status(transcript_path):
 
             step_type = data.get("type", "")
             if step_type == "USER_INPUT":
-                # 已经回溯到了当前轮次的起点
                 break
 
             tool_calls = data.get("tool_calls", [])
@@ -65,12 +64,12 @@ def main():
         fully_idle = payload.get("fullyIdle", True)
         transcript_path = payload.get("transcriptPath", "")
 
-        # 如果没有后台任务在运行，允许正常退出
+        # If no background tasks are running, allow normal termination
         if fully_idle:
             print(json.dumps({"decision": ""}))
             return
 
-        # 检查 transcript 路径兜底
+        # Fallback transcript path resolution
         if not transcript_path or not os.path.exists(transcript_path):
             conv_id = payload.get("conversationId", "")
             if conv_id:
@@ -82,24 +81,24 @@ def main():
 
         has_schedule, has_daemon = check_watchdog_status(transcript_path)
 
-        # 若已设置看门狗定时器或为常驻守护进程，允许挂起休眠
+        # Allow stopping if a watchdog timer is active or the task is a daemon
         if has_schedule or has_daemon:
             print(json.dumps({"decision": ""}))
             return
 
-        # 未设置看门狗定时器且非常驻服务，强行拦截终止行为
+        # Intercept termination if unmonitored background tasks exist
         resp = {
             "decision": "continue",
             "reason": (
-                "【Hook 看门狗安全拦截】检测到后台仍有正在运行的任务（fullyIdle=false），"
-                "但本轮交互尚未调用 schedule 设置看门狗定时器。"
-                "为防止底层终端管道死锁或进程卡死导致会话永久挂起，"
-                "请立即调用 schedule 工具设置一个合理的超时看门狗定时器（建议 60-120 秒）！"
+                "[Hook Watchdog Intercept] Active background task(s) detected, "
+                "but no schedule watchdog timer was set in this turn. "
+                "To prevent unmonitored hangs or pipe deadlocks, please check if the task is running normally "
+                "or call the schedule tool to set an appropriate watchdog timer."
             )
         }
         print(json.dumps(resp))
     except Exception:
-        # 异常兜底放行
+        # Fallback to allow stopping on unexpected errors
         print(json.dumps({"decision": ""}))
 
 if __name__ == "__main__":

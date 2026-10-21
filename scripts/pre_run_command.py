@@ -34,7 +34,8 @@ def main():
         wait_ms = parse_int(args.get("WaitMsBeforeAsync", 0))
 
         overwrites = {}
-        # 非守护任务：若同步等待时间低于 10000ms（系统上限），自动提升至 10000ms，避免过早转入后台
+        # For non-daemon tasks: if sync wait time is below 10000ms (system ceiling),
+        # elevate it to 10000ms to avoid premature background task degradation.
         if not is_daemon and wait_ms < 10000:
             overwrites["WaitMsBeforeAsync"] = 10000
 
@@ -44,7 +45,7 @@ def main():
 
         print(json.dumps(resp))
     except Exception:
-        # 异常兜底放行，保证不中断正常工具链
+        # Fallback to allow execution on unexpected errors
         print(json.dumps({"decision": "allow"}))
 
 if __name__ == "__main__":
