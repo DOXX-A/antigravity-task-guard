@@ -1,5 +1,9 @@
 # Antigravity Task Guard
 
+[English](README.md) | [简体中文](README_zh.md)
+
+---
+
 A deterministic lifecycle hook protection mechanism for terminal background tasks in Google Antigravity (AGY).
 
 ---
@@ -68,7 +72,8 @@ antigravity-task-guard/
 ├── install.ps1                # PowerShell installer
 ├── install.sh                 # Bash installer
 ├── LICENSE                    # MIT License
-└── README.md
+├── README.md                  # English documentation
+└── README_zh.md               # Chinese documentation
 ```
 
 ---
