@@ -11,6 +11,26 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "schedule",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/pre_schedule.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "manage_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/pre_manage_task.py",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "Stop": [

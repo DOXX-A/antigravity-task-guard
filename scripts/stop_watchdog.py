@@ -1,57 +1,12 @@
 import json
 import sys
-import os
+from task_state import (
+    analyze_transcript,
+    clean_str,
+    get_backoff_duration,
+    resolve_transcript_path,
+)
 
-def parse_bool(val, default=False):
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "1", "yes")
-    return default
-
-def check_watchdog_status(transcript_path):
-    """
-    Check if since the latest user input (USER_INPUT):
-    1. A schedule tool call was made
-    2. A run_command was marked as a long-running daemon (IsDaemon=True)
-    """
-    if not transcript_path or not os.path.exists(transcript_path):
-        return False, False
-
-    try:
-        with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-
-        has_schedule = False
-        has_daemon = False
-
-        # Traverse backwards to find the start of the current turn
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except Exception:
-                continue
-
-            step_type = data.get("type", "")
-            if step_type == "USER_INPUT":
-                break
-
-            tool_calls = data.get("tool_calls", [])
-            for call in tool_calls:
-                name = call.get("name", "")
-                if name == "schedule":
-                    has_schedule = True
-                elif name == "run_command":
-                    args = call.get("args", {})
-                    if parse_bool(args.get("IsDaemon", False)):
-                        has_daemon = True
-
-        return has_schedule, has_daemon
-    except Exception:
-        return False, False
 
 def main():
     try:
@@ -62,44 +17,64 @@ def main():
 
         payload = json.loads(input_data)
         fully_idle = payload.get("fullyIdle", True)
-        transcript_path = payload.get("transcriptPath", "")
+        termination_reason = clean_str(payload.get("terminationReason", ""))
 
-        # If no background tasks are running, allow normal termination
+        # 1. 若用户主动取消或因异常/配额上限终止，不拦截停止
+        if termination_reason and termination_reason != "NO_TOOL_CALL":
+            print(json.dumps({"decision": ""}))
+            return
+
+        # 2. 若系统底层确认没有任何后台任务或子代理，正常放行停止
         if fully_idle:
             print(json.dumps({"decision": ""}))
             return
 
-        # Fallback transcript path resolution
-        if not transcript_path or not os.path.exists(transcript_path):
-            conv_id = payload.get("conversationId", "")
-            if conv_id:
-                alt_path = os.path.expanduser(
-                    rf"~/.gemini/antigravity/brain/{conv_id}/.system_generated/logs/transcript.jsonl"
-                )
-                if os.path.exists(alt_path):
-                    transcript_path = alt_path
-
-        has_schedule, has_daemon = check_watchdog_status(transcript_path)
-
-        # Allow stopping if a watchdog timer is active or the task is a daemon
-        if has_schedule or has_daemon:
+        transcript_path = resolve_transcript_path(payload)
+        if not transcript_path:
             print(json.dumps({"decision": ""}))
             return
 
-        # Intercept termination if unmonitored background tasks exist
-        resp = {
-            "decision": "continue",
-            "reason": (
-                "[Hook Watchdog Intercept] Active background task(s) detected, "
-                "but no schedule watchdog timer was set in this turn. "
-                "To prevent unmonitored hangs or pipe deadlocks, please check if the task is running normally "
-                "or call the schedule tool to set an appropriate watchdog timer."
+        active_cmds, active_timers, _ = analyze_transcript(transcript_path)
+
+        # 3. 若当前没有活动的非守护 run_command 终端任务（例如后台仅有子代理 Subagent 或常驻 Daemon 服务），直接放行停止，无需监控子代理
+        if not active_cmds:
+            print(json.dumps({"decision": ""}))
+            return
+
+        # 4. 若当前已有活动的 schedule 看门狗定时器在运行，允许静默休眠等待唤醒
+        if active_timers:
+            print(json.dumps({"decision": ""}))
+            return
+
+        # 5. 存在未挂载看门狗的活动 run_command 任务，拦截休眠并按当前状态精准指引模型
+        active_task_ids = ", ".join(active_cmds.keys())
+        first_tid = next(iter(active_cmds.keys()))
+        max_schedule_count = max(info.get("schedule_count", 0) for info in active_cmds.values())
+        next_duration = get_backoff_duration(max_schedule_count)
+        uninspected_tasks = [
+            tid for tid, info in active_cmds.items() if info.get("timer_expired_uninspected", False)
+        ]
+
+        if uninspected_tasks:
+            reason = (
+                f"【Hook 看门狗安全拦截】后台终端命令任务 ({active_task_ids}) 仍在运行，且上一轮定时器已到期。"
+                f"请先调用 manage_task(Action='status', TaskId='{uninspected_tasks[0]}') 检查任务状态与日志输出："
+                "若任务已假死或管道死锁，请调用 manage_task(Action='kill') 将其终止；"
+                f"若任务仍在正常执行，检查后请调用 schedule 工具启动下一轮看门狗（无需计算时长，Hook 将自动为您设定为 {next_duration}s 及 TimerCondition='any'）！"
             )
-        }
-        print(json.dumps(resp))
+        else:
+            reason = (
+                f"【Hook 看门狗安全拦截】检测到后台仍有正在运行的终端命令任务 ({active_task_ids})，但当前未挂载活动的 schedule 看门狗定时器。"
+                f"若刚才的日志表明任务已假死或已完成输出但未退出，请调用 manage_task(Action='kill', TaskId='{first_tid}') 终止任务；"
+                f"若任务正在正常执行，请立即调用 schedule 工具挂载看门狗（随便传入任意 DurationSeconds 即可，Hook 将自动为您接管并设定为 {next_duration}s 及 TimerCondition='any'），"
+                "调用 schedule 后直接结束回复进入休眠！"
+            )
+
+        print(json.dumps({"decision": "continue", "reason": reason}))
     except Exception:
-        # Fallback to allow stopping on unexpected errors
+        # 异常兜底放行
         print(json.dumps({"decision": ""}))
+
 
 if __name__ == "__main__":
     main()

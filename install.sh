@@ -15,7 +15,6 @@ echo "Installing Antigravity Task Guard to [$SCOPE]: $TARGET_DIR"
 mkdir -p "$TARGET_DIR/scripts"
 
 cp "$CURRENT_DIR/hooks.json" "$TARGET_DIR/hooks.json"
-cp "$CURRENT_DIR/scripts/pre_run_command.py" "$TARGET_DIR/scripts/pre_run_command.py"
-cp "$CURRENT_DIR/scripts/stop_watchdog.py" "$TARGET_DIR/scripts/stop_watchdog.py"
+cp "$CURRENT_DIR/scripts/"*.py "$TARGET_DIR/scripts/"
 
 echo "Antigravity Task Guard installed successfully."

@@ -33,7 +33,8 @@ if (-not (Test-Path $scriptsDir)) {
 }
 
 Copy-Item (Join-Path $currentDir "hooks.json") -Destination (Join-Path $targetDir "hooks.json") -Force
-Copy-Item (Join-Path $currentDir "scripts\pre_run_command.py") -Destination (Join-Path $scriptsDir "pre_run_command.py") -Force
-Copy-Item (Join-Path $currentDir "scripts\stop_watchdog.py") -Destination (Join-Path $scriptsDir "stop_watchdog.py") -Force
+Get-ChildItem -Path (Join-Path $currentDir "scripts\*.py") | ForEach-Object {
+    Copy-Item $_.FullName -Destination (Join-Path $scriptsDir $_.Name) -Force
+}
 
 Write-Host "Antigravity Task Guard installed successfully." -ForegroundColor Green
